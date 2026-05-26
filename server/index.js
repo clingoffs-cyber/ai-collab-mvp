@@ -1,9 +1,12 @@
+import dotenv from 'dotenv';
 import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
+
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -41,6 +44,78 @@ const broadcastSession = () => {
   });
 };
 
+const AGENT_USER = { id: 'ai-agent', name: 'AI Agent', role: 'agent' };
+
+const markUserActive = (user) => {
+  if (!user) return;
+  user.lastActiveAt = Date.now();
+  user.inactivityNotifiedAt = undefined;
+};
+
+const createAgentChatMessage = (text, description) => {
+  const message = {
+    id: crypto.randomUUID(),
+    userId: AGENT_USER.id,
+    userName: AGENT_USER.name,
+    role: AGENT_USER.role,
+    text,
+    timestamp: Date.now(),
+  };
+
+  session.chat.push(message);
+  session.events.push(formatEvent('agent-message', AGENT_USER, description || 'AI Agent posted a shared tether message'));
+  io.emit('shared-chat-message', message);
+  broadcastSession();
+};
+
+const buildAgentPrompt = ({ eventType, user, text }) => {
+  switch (eventType) {
+    case 'user-joined':
+      return `A new user named "${user.name}" just joined the shared session tether. Respond as a friendly, personality-driven AI Agent greeting them, inviting them to participate in the tether chat. Keep the message upbeat, concise, and helpful.`;
+    case 'shared-chat-message':
+      return `A user named "${user.name}" just posted to the shared tether: "${text}". As the session AI Agent, add a short, helpful insight or friendly follow-up comment that keeps the conversation productive and inclusive.`;
+    case 'inactivity-warning':
+      return `These users appear inactive in the shared session tether: ${text}. As the session AI Agent, send a gentle, friendly nudge encouraging them to rejoin the conversation without being pushy.`;
+    default:
+      return `The shared session tether is active. As the AI Agent, provide a short, helpful comment or insight.`;
+  }
+};
+
+const scheduleAgentResponse = async (context) => {
+  try {
+    const prompt = buildAgentPrompt(context);
+    const aiText = await generateAiText(prompt);
+    createAgentChatMessage(aiText, `AI Agent responded to ${context.eventType}`);
+  } catch (error) {
+    console.error('[AGENT_RESPONSE_ERROR]', error);
+  }
+};
+
+const startInactivityWatcher = () => {
+  setInterval(async () => {
+    const now = Date.now();
+    const inactiveUsers = session.users.filter((user) => {
+      const lastActive = user.lastActiveAt || user.connectedAt || 0;
+      if (now - lastActive < 60_000) return false;
+      if (user.inactivityNotifiedAt && now - user.inactivityNotifiedAt < 300_000) return false;
+      return true;
+    });
+
+    if (inactiveUsers.length === 0) return;
+
+    const names = inactiveUsers.map((user) => user.name).join(', ');
+    inactiveUsers.forEach((user) => {
+      user.inactivityNotifiedAt = now;
+    });
+
+    session.events.push(formatEvent('agent-inactivity', AGENT_USER, `AI Agent noticed inactive users: ${names}`));
+    broadcastSession();
+    await scheduleAgentResponse({ eventType: 'inactivity-warning', text: names });
+  }, 30_000);
+};
+
+startInactivityWatcher();
+
 const findUser = (socketId) => session.users.find((entry) => entry.id === socketId);
 const findUserByToken = (token) => session.users.find((entry) => entry.token === token);
 
@@ -53,13 +128,58 @@ const createSummary = () => {
 
 const generateMockAiReply = (prompt) => `Mock AI reply: ${prompt.trim().slice(0, 120)}${prompt.trim().length > 120 ? '...' : ''}`;
 
-const generateAiText = async (prompt) => {
-  const apiKey = (process.env.AI_API_KEY || process.env.OPENAI_API_KEY || '').trim();
-  if (!apiKey) {
-    console.warn('No AI API key found (AI_API_KEY or OPENAI_API_KEY); using mock fallback response.');
+const generateGeminiText = async (prompt, apiKey) => {
+  const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              {
+                text: prompt,
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          maxOutputTokens: 1000,
+          temperature: 0.8,
+        },
+      }),
+    });
+
+    const data = await response.json();
+    console.log(`[GEMINI_DEBUG] Status: ${response.status}, candidates exists: ${!!data?.candidates}`);
+    
+    if (!response.ok) {
+      console.warn('Gemini API request failed', response.status, response.statusText, data?.error?.message || JSON.stringify(data));
+      return generateMockAiReply(prompt);
+    }
+    if (data?.error) {
+      console.warn('Gemini API returned error', data.error.message || JSON.stringify(data.error));
+      return generateMockAiReply(prompt);
+    }
+    if (!data?.candidates?.[0]?.content?.parts?.[0]?.text) {
+      console.warn('Gemini API returned unexpected response, falling back to mock.', response.status, response.statusText, JSON.stringify(data));
+      return generateMockAiReply(prompt);
+    }
+
+    const fullText = data.candidates[0].content.parts[0].text.trim();
+    console.log(`[GEMINI_RESPONSE_LENGTH] ${fullText.length} chars`);
+    return fullText;
+  } catch (error) {
+    console.error('Gemini AI generation failed:', error);
     return generateMockAiReply(prompt);
   }
+};
 
+const generateOpenAiText = async (prompt, apiKey) => {
   const apiBase = (process.env.OPENAI_API_BASE || 'https://api.openai.com/v1').replace(/\/$/, '');
   const model = process.env.AI_MODEL || 'gpt-3.5-turbo';
 
@@ -76,22 +196,48 @@ const generateAiText = async (prompt) => {
           { role: 'system', content: 'You are a helpful AI assistant providing a concise paragraph response.' },
           { role: 'user', content: prompt },
         ],
-        max_tokens: 250,
+        max_tokens: 1000,
         temperature: 0.8,
       }),
     });
 
     const data = await response.json();
+    if (!response.ok) {
+      console.warn('OpenAI API request failed', response.status, response.statusText, data?.error?.message || JSON.stringify(data));
+      return generateMockAiReply(prompt);
+    }
+    if (data?.error) {
+      console.warn('OpenAI API returned error', data.error.message || JSON.stringify(data.error));
+      return generateMockAiReply(prompt);
+    }
     if (!data || !data.choices || !data.choices[0] || !data.choices[0].message) {
-      console.warn('AI API returned unexpected response, falling back to mock.');
+      console.warn('AI API returned unexpected response, falling back to mock.', response.status, response.statusText, JSON.stringify(data));
       return generateMockAiReply(prompt);
     }
 
     return data.choices[0].message.content.trim();
   } catch (error) {
-    console.error('AI generation failed:', error);
+    console.error('OpenAI AI generation failed:', error);
     return generateMockAiReply(prompt);
   }
+};
+
+const generateAiText = async (prompt) => {
+  const geminiKey = (process.env.GEMINI_API_KEY || '').trim();
+  const openaiKey = (process.env.AI_API_KEY || process.env.OPENAI_API_KEY || '').trim();
+
+  if (!geminiKey && !openaiKey) {
+    console.warn('No AI API key found (GEMINI_API_KEY or AI_API_KEY); using mock fallback response.');
+    return generateMockAiReply(prompt);
+  }
+
+  // Prefer Gemini if key is available
+  if (geminiKey) {
+    return generateGeminiText(prompt, geminiKey);
+  }
+
+  // Fall back to OpenAI
+  return generateOpenAiText(prompt, openaiKey);
 };
 
 io.on('connection', (socket) => {
@@ -121,6 +267,11 @@ io.on('connection', (socket) => {
       // remove any previous entries with this socket id and add
       session.users = session.users.filter((entry) => entry.id !== socket.id).concat(user);
       session.events.push(formatEvent('user-joined', user, `${user.name} joined the session`));
+      markUserActive(user);
+      broadcastSession();
+      if (user.role !== 'agent') {
+        scheduleAgentResponse({ eventType: 'user-joined', user });
+      }
     }
 
     socket.emit('session-state', {
@@ -130,13 +281,13 @@ io.on('connection', (socket) => {
       events: session.events,
       chat: session.chat,
     });
-    broadcastSession();
   });
 
   socket.on('personal-prompt', async ({ text }) => {
     const user = findUser(socket.id);
     if (!user || typeof text !== 'string' || !text.trim()) return;
 
+    markUserActive(user);
     session.events.push(formatEvent('prompt-sent', user, `${user.name} sent a prompt`));
     broadcastSession();
 
@@ -156,6 +307,7 @@ io.on('connection', (socket) => {
       text: aiText,
       timestamp: Date.now(),
     });
+    console.log(`[SOCKET_EMIT_LENGTH] ${aiText.length} chars`);
 
     session.events.push(formatEvent('response-received', user, `${user.name} received a response`));
     broadcastSession();
@@ -179,6 +331,11 @@ io.on('connection', (socket) => {
     session.chat.push(chatMessage);
     io.emit('shared-chat-message', chatMessage);
     broadcastSession();
+
+    markUserActive(user);
+    if (user.role !== 'agent') {
+      scheduleAgentResponse({ eventType: 'shared-chat-message', user, text: chatMessage.text });
+    }
   });
 
   socket.on('request-summary', () => {

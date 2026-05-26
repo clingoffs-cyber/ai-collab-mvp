@@ -1,529 +1,460 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
 
-const getSocketUrl = () => {
-  if (import.meta.env.VITE_API_URL) {
-    return import.meta.env.VITE_API_URL;
-  }
-
-  if (typeof window === 'undefined') {
-    return '';
-  }
-
-  const origin = window.location.origin;
-  const host = window.location.host;
-
-  if (host.includes('-5173.app.github.dev')) {
-    return origin.replace('-5173.app.github.dev', '-3000.app.github.dev');
-  }
-
-  // If running locally and no explicit API URL provided, assume the backend is on port 3000.
-  try {
-    const url = new URL(origin);
-    const hostname = url.hostname;
-    if ((hostname === 'localhost' || hostname === '127.0.0.1') && url.port && url.port !== '3000') {
-      return `${url.protocol}//${hostname}:3000`;
-    }
-  } catch (e) {
-    // ignore and fallback
-  }
-
-  return origin;
-};
-
-const SOCKET_URL = getSocketUrl();
-const socket = io(SOCKET_URL, {
-  autoConnect: false,
-  path: '/socket.io',
-});
-
-const formatTime = (timestamp) => new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
-function App() {
-  const [connected, setConnected] = useState(false);
-  const [joined, setJoined] = useState(false);
-  const [loginName, setLoginName] = useState('');
-  const [loginRole, setLoginRole] = useState('human');
-  const [user, setUser] = useState(null);
-  const joinSessionRef = useRef(false);
-  const [session, setSession] = useState({ id: '', createdAt: null, users: [], events: [], chat: [] });
-  const [personalHistory, setPersonalHistory] = useState([]);
-  const [personalInput, setPersonalInput] = useState('');
-  const [tetherInput, setTetherInput] = useState('');
-  const [popoutOpen, setPopoutOpen] = useState(false);
+export default function App() {
+  const [hideTether, setHideTether] = useState(false);
+  const [messages, setMessages] = useState([]);
+  const [inputValue, setInputValue] = useState("");
+  const [tetherInput, setTetherInput] = useState("");
   const [autoOpenOnMessage, setAutoOpenOnMessage] = useState(false);
-  const [dock, setDock] = useState('right');
+  const [dockSide, setDockSide] = useState('Right');
 
+  const [tetherMessages, setTetherMessages] = useState([
+    { sender: 'AI Agent', text: 'Hey there, Jeff! 👋 Shared session tether connected.' }
+  ]);
+  const [showHistory, setShowHistory] = useState(false);
+  const [activeView, setActiveView] = useState('workspace');
+  const [newUserName, setNewUserName] = useState('');
+  const [joinCode, setJoinCode] = useState('');
+  const [usersInSession, setUsersInSession] = useState([
+    { name: 'Jeff', role: 'Human' }
+  ]);
+
+  const [currentUserName, setCurrentUserName] = useState('Jeff');
+
+  // Restore per-tab active user from sessionStorage and shared roster from localStorage
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const savedName = window.localStorage.getItem('ai-collab-user-name');
-    const savedRole = window.localStorage.getItem('ai-collab-user-role');
-    const savedToken = window.localStorage.getItem('ai-collab-user-token');
-    const savedAutoOpen = window.localStorage.getItem('ai-collab-auto-open');
-    const savedDock = window.localStorage.getItem('ai-collab-dock-side');
-
-    if (savedAutoOpen !== null) {
-      setAutoOpenOnMessage(savedAutoOpen === 'true');
-    }
-    if (savedDock === 'left' || savedDock === 'right') {
-      setDock(savedDock);
-    }
-
-    if (savedName && savedRole) {
-      setLoginName(savedName);
-      setLoginRole(savedRole);
-      setUser({ id: '', name: savedName, role: savedRole, token: savedToken || '' });
-      setJoined(true);
-      if (socket.connected) {
-        socket.emit('join-session', { name: savedName, role: savedRole, token: savedToken });
+    try {
+      const savedCurrent = sessionStorage.getItem('currentUserName');
+      if (savedCurrent) {
+        setCurrentUserName(savedCurrent);
       }
+
+      const storedRoster = localStorage.getItem('usersInSession');
+      if (storedRoster) {
+        setUsersInSession(JSON.parse(storedRoster));
+      } else {
+        // initialize localStorage roster so other tabs can pick it up
+        localStorage.setItem('usersInSession', JSON.stringify(usersInSession));
+      }
+    } catch (e) {
+      console.warn('Storage restore failed', e);
     }
 
-    // Do not connect here; connection will be established after listeners are registered
+    const onStorage = (ev) => {
+      if (ev.key === 'usersInSession') {
+        try {
+          const parsed = JSON.parse(ev.newValue || '[]');
+          setUsersInSession(parsed);
+        } catch (e) {
+          console.warn('Failed parsing usersInSession from storage event', e);
+        }
+      }
+    };
+
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
   }, []);
 
+  // Socket connection for real-time session sync and shared tether chat
+  const socketRef = useRef(null);
+  const pendingTimersRef = useRef([]);
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    window.localStorage.setItem('ai-collab-auto-open', autoOpenOnMessage ? 'true' : 'false');
-  }, [autoOpenOnMessage]);
+    // Connect to server (dev server on port 3000)
+    const SOCKET_URL = typeof window !== 'undefined' ? `${window.location.protocol}//${window.location.hostname}:3000` : 'http://localhost:3000';
+    const socket = io(SOCKET_URL);
+    socketRef.current = socket;
 
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    window.localStorage.setItem('ai-collab-dock-side', dock);
-  }, [dock]);
-
-  useEffect(() => {
     socket.on('connect', () => {
-      setConnected(true);
-      if (joined && user) {
-        socket.emit('join-session', { name: user.name, role: user.role, token: user.token });
-        joinSessionRef.current = true;
+      try {
+        socket.emit('join-session', { name: currentUserName, role: 'human' });
+      } catch (e) {
+        console.warn('Failed to emit join-session on connect', e);
       }
-    });
-    socket.on('disconnect', () => setConnected(false));
-    socket.on('session-state', (payload) => setSession(payload));
-    socket.on('shared-chat-message', (message) => {
-      console.log('Received shared-chat-message:', message);
-      setSession((current) => ({
-        ...current,
-        chat: [...current.chat, message],
-      }));
-      if (autoOpenOnMessage && !popoutOpen) {
-        setPopoutOpen(true);
-      }
-    });
-    socket.on('personal-response', (message) => {
-      setPersonalHistory((current) => [
-        ...current,
-        { id: message.id, role: 'assistant', text: message.text, timestamp: message.timestamp },
-      ]);
     });
 
-    if (!socket.connected) socket.connect();
+    socket.on('shared-chat-message', (msg) => {
+      setTetherMessages((prev) => [...prev, msg]);
+    });
+
+    socket.on('personal-response', (payload) => {
+      // Replace the first loading placeholder with the AI response
+      setMessages(prev => {
+        const idx = prev.findIndex(m => m.loading);
+        if (idx !== -1) {
+          const copy = [...prev];
+          copy[idx] = { sender: 'ai', text: payload.text };
+          return copy;
+        }
+        return [...prev, { sender: 'ai', text: payload.text }];
+      });
+
+      // Clear one pending timeout corresponding to this response
+      const t = pendingTimersRef.current.shift();
+      if (t) clearTimeout(t);
+    });
+
+    socket.on('session-state', (data) => {
+      if (data?.users) setUsersInSession(data.users);
+      if (data?.chat) setTetherMessages(data.chat || []);
+    });
 
     return () => {
-      socket.off('connect');
-      socket.off('disconnect');
-      socket.off('session-state');
-      socket.off('shared-chat-message');
-      socket.off('personal-response');
+      try { socket.disconnect(); } catch (e) {}
+      socketRef.current = null;
     };
-  }, [autoOpenOnMessage, popoutOpen, joined, user]);
+  }, []);
 
+  // When currentUserName changes, tell the server this tab wants to be that user
   useEffect(() => {
-    if (!joined || !user) {
-      joinSessionRef.current = false;
-      return;
+    try {
+      sessionStorage.setItem('currentUserName', currentUserName);
+    } catch (e) {
+      console.warn('Failed saving currentUserName', e);
     }
-
-    if (socket.connected && !joinSessionRef.current) {
-      socket.emit('join-session', { name: user.name, role: user.role, token: user.token });
-      joinSessionRef.current = true;
+    if (socketRef.current && socketRef.current.connected) {
+      socketRef.current.emit('join-session', { name: currentUserName, role: 'human' });
     }
-  }, [joined, user, connected]);
+  }, [currentUserName]);
 
-  const activeUserCount = useMemo(() => session.users.length, [session.users]);
+  const handleCreateUser = () => {
+    const name = newUserName.trim();
+    if (!name) return;
 
-  const handleLogout = () => {
-    if (typeof window !== 'undefined') {
-      window.localStorage.removeItem('ai-collab-user-name');
-      window.localStorage.removeItem('ai-collab-user-role');
-      window.localStorage.removeItem('ai-collab-user-token');
-      window.localStorage.removeItem('ai-collab-auto-open');
-      window.localStorage.removeItem('ai-collab-dock-side');
-    }
+    const newUser = { name, role: 'Human' };
+    setUsersInSession(prev => {
+      const next = [...prev, newUser];
+      try { localStorage.setItem('usersInSession', JSON.stringify(next)); } catch (e) { console.warn('Failed saving usersInSession', e); }
+      return next;
+    });
 
-    if (socket.connected) {
-      socket.emit('logout');
-    }
+    // Optionally add a presence message to the tether chat for visibility in the UI
+    setTetherMessages(prev => [...prev, { sender: newUser.name, text: 'joined the session.' }]);
 
-    setUser(null);
-    setJoined(false);
-    setLoginName('');
-    setLoginRole('human');
-    setSession({ id: '', createdAt: null, users: [], events: [], chat: [] });
-    setPersonalHistory([]);
-    setPersonalInput('');
-    setTetherInput('');
-    setPopoutOpen(false);
+    // Make this tab operate as the newly created user (local active identity)
+    setCurrentUserName(name);
+    try { sessionStorage.setItem('currentUserName', name); } catch (e) { console.warn('Failed saving currentUserName', e); }
+
+    // Clear the input only after successful addition
+    setNewUserName('');
   };
 
-  const handleRemoveUser = (userId) => {
-    if (!userId || !socket.connected) return;
-    socket.emit('removeUser', { userId });
-  };
-
-  const handleJoin = (event) => {
-    event.preventDefault();
-    if (!loginName.trim()) return;
-
-    const trimmedName = loginName.trim();
-    const userInfo = {
-      id: '',
-      name: trimmedName,
-      role: loginRole,
-    };
-
-    if (typeof window !== 'undefined') {
-      window.localStorage.setItem('ai-collab-user-name', trimmedName);
-      window.localStorage.setItem('ai-collab-user-role', loginRole);
-      let token = window.localStorage.getItem('ai-collab-user-token');
-      if (!token && window.crypto && window.crypto.randomUUID) {
-        token = window.crypto.randomUUID();
-        window.localStorage.setItem('ai-collab-user-token', token);
-      } else if (!token) {
-        token = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-        window.localStorage.setItem('ai-collab-user-token', token);
-      }
-      userInfo.token = token;
-    }
-
-    if (!socket.connected) {
-      socket.connect();
-    }
-
-    setUser(userInfo);
-    setJoined(true);
-    // If already connected, emit immediately; otherwise the connect handler will emit once connected
-    if (socket.connected) {
-      socket.emit('join-session', { name: trimmedName, role: loginRole, token: userInfo.token });
-    }
-  };
-
-  const handleSendPersonal = (event) => {
-    event.preventDefault();
-    const text = personalInput.trim();
+  const handleSendMessage = () => {
+    const text = inputValue.trim();
     if (!text) return;
 
-    setPersonalHistory((history) => [
-      ...history,
-      { id: `${Date.now()}-user`, role: 'user', text, timestamp: Date.now() },
-    ]);
-    socket.emit('personal-prompt', { text });
-    setPersonalInput('');
+    // Append the user's prompt locally
+    setMessages(prev => [...prev, { sender: 'human', text }]);
+
+    // If socket connected, emit to server; otherwise show error
+    if (socketRef.current && socketRef.current.connected) {
+      // Add a loading placeholder AI message which will be replaced by server response
+      setMessages(prev => [...prev, { sender: 'ai', text: 'Waiting for AI...', loading: true }]);
+
+      // Start a timeout to show an error if response doesn't arrive
+      const to = setTimeout(() => {
+        setMessages(prev => {
+          const idx = prev.findIndex(m => m.loading);
+          if (idx === -1) return prev;
+          const copy = [...prev];
+          copy[idx] = { sender: 'ai', text: 'AI request timed out. Please try again.', error: true };
+          return copy;
+        });
+      }, 15000);
+      pendingTimersRef.current.push(to);
+
+      socketRef.current.emit('personal-prompt', { text });
+
+      // Clear the input since request was submitted
+      setInputValue('');
+    } else {
+      // Not connected: show an error message and keep the input intact
+      setMessages(prev => [...prev, { sender: 'ai', text: 'AI service unavailable (offline).', error: true }]);
+    }
   };
 
-  const handleSendTether = (event) => {
-    event.preventDefault();
-    const text = tetherInput.trim();
-    if (!text) return;
-
-    socket.emit('shared-chat-message', { text });
-    setTetherInput('');
+  const handleSendTetherMessage = () => {
+    if (!tetherInput.trim()) return;
+    if (socketRef.current && socketRef.current.connected) {
+      socketRef.current.emit('shared-chat-message', { text: tetherInput });
+    } else {
+      setTetherMessages(prev => [...prev, { sender: currentUserName, text: tetherInput }]);
+    }
+    setTetherInput("");
   };
-
-  const handleRequestSummary = () => {
-    socket.emit('request-summary');
-    if (!popoutOpen) setPopoutOpen(true);
-  };
-
-  const brandLabel = user?.role === 'agent' ? 'Agent console' : 'Personal AI window';
 
   return (
-    <div className="min-h-screen bg-slate-950 px-4 py-8 text-slate-100">
-      <div className="mx-auto max-w-6xl">
-        <div className="mb-8 flex flex-col gap-4 rounded-3xl border border-slate-700 bg-slate-900/90 p-6 shadow-xl shadow-slate-900/40">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <h1 className="text-3xl font-semibold text-white">AI Collab MVP</h1>
-              <p className="mt-2 text-sm text-slate-400">Independent AI windows with a shared session tether and pop-out presence panel.</p>
-            </div>
-            <div className="flex flex-wrap items-center gap-3">
-              <span className={`rounded-full px-4 py-2 text-xs font-medium ${connected ? 'bg-emerald-500/15 text-emerald-300' : 'bg-amber-500/10 text-amber-300'}`}>
-                {connected ? 'Connected' : 'Disconnected'}
-              </span>
-              <span className="rounded-full bg-slate-800/80 px-4 py-2 text-xs text-slate-300">Session users: {activeUserCount}</span>
-              {joined && user && (
-                <div className="flex items-center gap-2 rounded-3xl bg-slate-800/80 px-4 py-2 text-xs text-slate-300">
-                  <span>{user.name} ({user.role === 'agent' ? 'Agent' : 'Human'})</span>
-                  <button onClick={handleLogout} className="rounded-full bg-slate-700 px-3 py-1 text-[11px] font-semibold text-slate-100 transition hover:bg-slate-600">
-                    Logout
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col w-full h-screen overflow-hidden select-none">
+      
+      {/* Top Banner Control Panel Bar */}
+      <div className="flex justify-between items-center bg-slate-900/40 border-b border-slate-900/80 px-6 py-4">
+        <div>
+          <h1 className="text-base font-bold text-slate-100 tracking-tight">AI Collab MVP</h1>
+          <p className="text-[11px] text-slate-300 mt-0.5">Independent AI windows with a shared session tether and pop-out presence panel.</p>
         </div>
-
-        {!joined && (
-          <div className="mx-auto max-w-xl rounded-3xl border border-slate-700 bg-slate-900/90 p-6 shadow-lg shadow-slate-900/30">
-            <h2 className="text-xl font-semibold text-white">Join the shared session</h2>
-            <form onSubmit={handleJoin} className="mt-5 space-y-4">
-              <label className="block text-sm font-medium text-slate-300">Name</label>
-              <input
-                value={loginName}
-                onChange={(event) => setLoginName(event.target.value)}
-                className="w-full rounded-3xl border border-slate-700 bg-slate-950/90 px-4 py-3 text-slate-100 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/20"
-                placeholder="Your name"
-              />
-              <div className="space-y-2">
-                <p className="text-sm font-medium text-slate-300">Login as</p>
-                <div className="flex gap-3">
-                  <label className="inline-flex items-center gap-2 text-sm text-slate-300">
-                    <input type="radio" name="loginRole" value="human" checked={loginRole === 'human'} onChange={() => setLoginRole('human')} />
-                    Human
-                  </label>
-                  <label className="inline-flex items-center gap-2 text-sm text-slate-300">
-                    <input type="radio" name="loginRole" value="agent" checked={loginRole === 'agent'} onChange={() => setLoginRole('agent')} />
-                    AI Agent
-                  </label>
-                </div>
-              </div>
-              <button className="w-full rounded-3xl bg-sky-500 px-5 py-3 text-sm font-semibold text-slate-950 transition hover:bg-sky-400" type="submit">
-                Join session
-              </button>
-            </form>
-          </div>
-        )}
-
-        {joined && (
-          <div className="grid gap-6 xl:grid-cols-[1.2fr_0.8fr]">
-            <section className="rounded-3xl border border-slate-700 bg-slate-900/90 p-6 shadow-lg shadow-slate-900/20">
-              <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                <div>
-                  <h2 className="text-2xl font-semibold text-white">{brandLabel}</h2>
-                  <p className="text-sm text-slate-400">Separate chat history for this user only.</p>
-                </div>
-                <div className="rounded-3xl bg-slate-950/80 px-4 py-2 text-sm text-slate-300">Role: {user.role === 'agent' ? 'Agent' : 'Human'}</div>
-              </div>
-
-              <div className="flex h-[60vh] flex-col gap-4 overflow-hidden rounded-3xl border border-slate-800 bg-slate-950/80 p-4">
-                <div className="flex-1 space-y-3 overflow-y-auto pr-2">
-                  {personalHistory.length === 0 ? (
-                    <div className="rounded-3xl border border-dashed border-slate-700 p-6 text-sm text-slate-400">Your private AI history appears here after you send a prompt.</div>
-                  ) : (
-                    personalHistory.map((entry) => (
-                      <div key={entry.id} className={entry.role === 'user' ? 'rounded-3xl bg-slate-800/80 p-4 text-slate-100' : 'rounded-3xl bg-slate-700/80 p-4 text-slate-100'}>
-                        <div className="mb-1 text-xs uppercase tracking-[0.2em] text-slate-500">{entry.role === 'user' ? 'You' : 'AI'}</div>
-                        <div className="text-sm leading-6">{entry.text}</div>
-                        <div className="mt-2 text-[11px] text-slate-500">{formatTime(entry.timestamp)}</div>
-                      </div>
-                    ))
-                  )}
-                </div>
-
-                <form onSubmit={handleSendPersonal} className="mt-2 flex gap-3">
-                  <input
-                    value={personalInput}
-                    onChange={(event) => setPersonalInput(event.target.value)}
-                    placeholder="Send a personal AI prompt"
-                    className="flex-1 rounded-3xl border border-slate-700 bg-slate-950/90 px-4 py-3 text-slate-100 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/20"
-                  />
-                  <button className="rounded-3xl bg-sky-500 px-5 py-3 text-sm font-semibold text-slate-950 transition hover:bg-sky-400" type="submit">
-                    Send
-                  </button>
-                </form>
-              </div>
-            </section>
-
-            <section className="rounded-3xl border border-slate-700 bg-slate-900/90 p-6 shadow-lg shadow-slate-900/20">
-              <div className="mb-4 flex items-center justify-between gap-3">
-                <div>
-                  <h2 className="text-2xl font-semibold text-white">Session tether</h2>
-                  <p className="text-sm text-slate-400">Presence, shared chat, and activity feed.</p>
-                </div>
-                <div className="text-sm text-slate-400">ID: {session.id}</div>
-              </div>
-
-              <div className="space-y-4">
-                <div className="rounded-3xl border border-slate-800 bg-slate-950/80 p-4">
-                  <div className="mb-3 flex items-center justify-between gap-3">
-                    <p className="text-sm font-medium text-slate-200">Users in session</p>
-                    {user.role === 'agent' && (
-                      <button onClick={handleRequestSummary} className="rounded-full bg-slate-800 px-3 py-1 text-xs text-slate-200 transition hover:bg-slate-700">
-                        Generate summary
-                      </button>
-                    )}
-                  </div>
-                  <ul className="space-y-2 text-sm text-slate-300">
-                    {session.users.map((entry) => (
-                      <li key={entry.id} className="flex items-center justify-between gap-3 rounded-2xl bg-slate-900/90 px-3 py-2">
-                        <div>
-                          <div>{entry.name}</div>
-                          <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">{entry.role === 'agent' ? 'Agent' : 'Human'}</div>
-                        </div>
-                        <button
-                          onClick={() => handleRemoveUser(entry.id)}
-                          className="rounded-full bg-rose-500/10 px-3 py-1 text-[11px] font-semibold text-rose-300 transition hover:bg-rose-500/20"
-                        >
-                          Remove
-                        </button>
-                      </li>
-                    ))}
-                    {session.users.length === 0 && <li className="rounded-2xl bg-slate-900/90 px-3 py-2 text-slate-500">No users connected yet.</li>}
-                  </ul>
-                </div>
-
-                <div className="rounded-3xl border border-slate-800 bg-slate-950/80 p-4">
-                  <p className="mb-3 text-sm font-medium text-slate-200">Shared tether chat</p>
-                  <div className="mb-3 max-h-52 space-y-3 overflow-y-auto pr-2 text-sm text-slate-100">
-                    {session.chat.length === 0 ? (
-                      <div className="rounded-2xl bg-slate-900/90 p-3 text-slate-500">Shared chat messages appear here.</div>
-                    ) : (
-                      session.chat.map((message) => (
-                        <div key={message.id} className="rounded-2xl bg-slate-900/90 p-3">
-                          <div className="text-xs uppercase tracking-[0.2em] text-slate-500">{message.userName}</div>
-                          <div className="mt-1 text-sm leading-6 text-slate-100">{message.text}</div>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                  <form onSubmit={handleSendTether} className="flex gap-3">
-                    <input
-                      value={tetherInput}
-                      onChange={(event) => setTetherInput(event.target.value)}
-                      placeholder="Send to shared tether"
-                      className="flex-1 rounded-3xl border border-slate-700 bg-slate-950/90 px-4 py-3 text-slate-100 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/20"
-                    />
-                    <button className="rounded-3xl bg-slate-700 px-4 py-3 text-sm font-semibold text-slate-200 transition hover:bg-slate-600" type="submit">
-                      Post
-                    </button>
-                  </form>
-                </div>
-
-                <div className="rounded-3xl border border-slate-800 bg-slate-950/80 p-4">
-                  <div className="mb-3 flex items-center justify-between gap-3">
-                    <p className="text-sm font-medium text-slate-200">Activity feed</p>
-                    <span className="rounded-full bg-slate-800 px-2 py-1 text-[11px] text-slate-400">{session.events.length}</span>
-                  </div>
-                  <div className="space-y-2 text-sm text-slate-300">
-                    {session.events.slice(-6).reverse().map((event) => (
-                      <div key={event.id} className="rounded-2xl bg-slate-900/90 px-3 py-3">
-                        <div className="text-xs uppercase tracking-[0.2em] text-slate-500">{formatTime(event.timestamp)}</div>
-                        <div>{event.description}</div>
-                      </div>
-                    ))}
-                    {session.events.length === 0 && <div className="rounded-2xl bg-slate-900/90 px-3 py-3 text-slate-500">No session activity yet.</div>}
-                  </div>
-                </div>
-
-                <div className="rounded-3xl border border-slate-800 bg-slate-950/80 p-4">
-                  <p className="mb-3 text-sm font-medium text-slate-200">Pop-out settings</p>
-                  <div className="space-y-4 text-sm text-slate-300">
-                    <div className="flex items-center justify-between gap-3 rounded-3xl bg-slate-900/90 px-4 py-3">
-                      <span>Auto-open on message</span>
-                      <button
-                        type="button"
-                        onClick={() => setAutoOpenOnMessage((current) => !current)}
-                        className={`rounded-full px-4 py-2 text-xs font-semibold ${autoOpenOnMessage ? 'bg-emerald-500 text-slate-950' : 'bg-slate-800 text-slate-300'}`}
-                      >
-                        {autoOpenOnMessage ? 'ON' : 'OFF'}
-                      </button>
-                    </div>
-                    <div className="rounded-3xl bg-slate-900/90 px-4 py-3">
-                      <div className="mb-2 text-sm text-slate-400">Dock side</div>
-                      <div className="flex gap-3">
-                        <button
-                          type="button"
-                          onClick={() => setDock('left')}
-                          className={`rounded-3xl px-4 py-2 text-xs font-semibold ${dock === 'left' ? 'bg-sky-500 text-slate-950' : 'bg-slate-800 text-slate-300'}`}
-                        >
-                          Left
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setDock('right')}
-                          className={`rounded-3xl px-4 py-2 text-xs font-semibold ${dock === 'right' ? 'bg-sky-500 text-slate-950' : 'bg-slate-800 text-slate-300'}`}
-                        >
-                          Right
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </section>
-          </div>
-        )}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setActiveView(activeView === 'workspace' ? 'newUser' : 'workspace')}
+            className="bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs px-3 py-1.5 rounded-lg transition"
+          >
+            {activeView === 'workspace' ? 'Add New User' : 'Back to Workspace'}
+          </button>
+          <span className="bg-emerald-950 text-emerald-400 border border-emerald-900 text-[10px] px-2.5 py-0.5 rounded-full font-bold mr-2">Connected</span>
+          <span className="text-xs text-slate-300 font-medium bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-800">{currentUserName} (Human)</span>
+          <button className="bg-slate-900 hover:bg-slate-800 text-slate-400 border border-slate-800 text-xs px-3 py-1.5 rounded-lg transition">Logout</button>
+        </div>
       </div>
 
-      {joined && (
-        <div className={`fixed top-24 z-50 ${dock === 'right' ? 'right-4' : 'left-4'}`}>
-          <button
-            onClick={() => setPopoutOpen((open) => !open)}
-            className="rounded-full bg-sky-500 px-4 py-3 text-sm font-semibold text-slate-950 shadow-lg shadow-slate-900/40 transition hover:bg-sky-400"
+      {/* Primary Sub-Heading Block Header (labels removed to reclaim vertical space) */}
+      <div className="px-6 pt-5 pb-1 flex justify-between items-center">
+        <div />
+        <div className="flex gap-2">
+          <button 
+            onClick={() => setHideTether(!hideTether)}
+            className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold px-4 py-2 rounded-lg transition border border-slate-700"
           >
-            {popoutOpen ? 'Hide tether' : 'Show tether'}
+            {hideTether ? "Show tether" : "Hide tether"}
           </button>
-          {popoutOpen && (
-            <div className="mt-3 w-[320px] rounded-3xl border border-slate-700 bg-slate-900/95 p-4 shadow-2xl shadow-slate-950/60">
-              <div className="mb-3 flex items-center justify-between gap-3">
-                <div>
-                  <div className="text-sm font-semibold text-white">Session tether</div>
-                  <div className="text-xs text-slate-400">Presence and activity</div>
+        </div>
+      </div>
+
+      {/* Main Layout Split */}
+      <div className={`flex flex-1 p-6 gap-6 min-h-0 w-full ${dockSide === 'Left' ? 'flex-row-reverse' : 'flex-row'}`}>
+        
+        {/* Main Workspace / Add New User Panel */}
+        <div className="flex-1 bg-slate-900/20 border border-slate-900 rounded-xl p-5 flex flex-col justify-between relative">
+          {activeView === 'workspace' ? (
+            <>
+              <div className="flex flex-col flex-1 min-h-0">
+                <div className="flex justify-between items-center mb-4 pb-3 border-b border-slate-900">
+                  <div />
+                  <div className="bg-slate-950 border border-slate-800 px-3 py-1 rounded-md">
+                    <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Human Role</span>
+                  </div>
                 </div>
-                <button onClick={() => setPopoutOpen(false)} className="text-slate-400 transition hover:text-slate-100">Close</button>
-              </div>
-              <div className="space-y-3 text-sm text-slate-300">
-                <div className="rounded-3xl bg-slate-950/80 p-3">
-                  <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Users</div>
-                  <div className="mt-2 space-y-2">
-                    {session.users.map((entry) => (
-                      <div key={entry.id} className="flex items-center justify-between rounded-2xl bg-slate-900/90 px-3 py-2">
-                        <span>{entry.name}</span>
-                        <span className="text-[10px] uppercase tracking-[0.2em] text-slate-500">{entry.role}</span>
+                
+                <div className="flex-1 overflow-y-auto space-y-4 pr-2">
+                  {messages.length > 0 && messages.map((msg, idx) => (
+                      <div 
+                        key={idx} 
+                        className={`flex flex-col max-w-[75%] rounded-xl p-3 text-sm border ${
+                          msg.sender === 'human' 
+                            ? 'bg-sky-950/40 border-sky-800 text-slate-100 self-end ml-auto' 
+                            : 'bg-slate-900/60 border-slate-800 text-slate-100 self-start'
+                        }`}
+                      >
+                        <span className="text-[9px] font-mono uppercase tracking-wider text-sky-400 mb-1 font-bold">
+                          {msg.sender === 'human' ? 'You' : 'Personal AI'}
+                        </span>
+                        <p className="leading-relaxed whitespace-pre-wrap font-medium">{msg.text}</p>
                       </div>
                     ))}
-                    {session.users.length === 0 && <div className="rounded-2xl bg-slate-900/90 px-3 py-2 text-slate-500">No users yet.</div>}
+                </div>
+              </div>
+
+              <div className="flex gap-3 mt-4 pt-4 border-t border-slate-900">
+                <input 
+                  type="text" 
+                  value={inputValue}
+                  onChange={(e) => setInputValue(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
+                  placeholder="Send a personal AI prompt" 
+                  className="flex-1 bg-slate-950/60 border border-sky-600 rounded-xl px-4 py-3 text-xs text-slate-100 placeholder-slate-300 font-medium focus:outline-none focus:border-sky-500"
+                />
+                <button 
+                  onClick={handleSendMessage}
+                  className="bg-sky-600 hover:bg-sky-500 text-slate-950 text-xs font-bold px-6 py-3 rounded-xl transition shadow"
+                >
+                  Send
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className="flex flex-col flex-1 min-h-0">
+              <div className="mb-6">
+                <div className="flex items-center justify-between mb-4">
+                  <div>
+                    <h2 className="text-lg font-bold text-slate-100">Create New User / Join Session</h2>
+                    <p className="text-sm text-slate-400 mt-1">Keep your current session active while onboarding another user.</p>
                   </div>
                 </div>
-                <div className="rounded-3xl bg-slate-950/80 p-3">
-                  <div className="mb-2 text-[11px] uppercase tracking-[0.2em] text-slate-500">Chat</div>
-                  <div className="space-y-2 max-h-48 overflow-y-auto">
-                    {session.chat.length === 0 ? (
-                      <div className="rounded-2xl bg-slate-900/90 px-3 py-2 text-slate-500">No shared messages.</div>
-                    ) : (
-                      session.chat.slice(-6).map((message) => (
-                        <div key={message.id} className="rounded-2xl bg-slate-900/90 px-3 py-2">
-                          <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">{message.userName}</div>
-                          <div className="mt-1 text-sm text-slate-100">{message.text}</div>
-                        </div>
-                      ))
-                    )}
-                  </div>
+
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <section className="bg-slate-950/40 border border-slate-900 rounded-3xl p-5 space-y-4">
+                    <div>
+                      <h3 className="text-sm font-semibold text-slate-100">Create new user</h3>
+                      <p className="text-xs text-slate-500 mt-1">Add another human collaborator without interrupting the active session.</p>
+                    </div>
+                    <label className="block text-[11px] text-slate-400 uppercase tracking-[0.18em] font-semibold">New user name</label>
+                    <input
+                      type="text"
+                      value={newUserName}
+                      onChange={(e) => setNewUserName(e.target.value)}
+                      placeholder="Enter user name"
+                      className="w-full bg-slate-900 border border-slate-800 rounded-2xl px-4 py-3 text-sm text-slate-100 focus:outline-none focus:border-sky-500"
+                    />
+                    <button
+                      onClick={handleCreateUser}
+                      className="w-full bg-sky-600 hover:bg-sky-500 text-slate-950 text-xs font-bold uppercase tracking-wide py-3 rounded-2xl transition"
+                    >
+                      Create user
+                    </button>
+                  </section>
+
+                  <section className="bg-slate-950/40 border border-slate-900 rounded-3xl p-5 space-y-4">
+                    <div>
+                      <h3 className="text-sm font-semibold text-slate-100">Join existing session</h3>
+                      <p className="text-xs text-slate-500 mt-1">Invite a new user into the current session using a link or code.</p>
+                    </div>
+                    <label className="block text-[11px] text-slate-400 uppercase tracking-[0.18em] font-semibold">Session code</label>
+                    <input
+                      type="text"
+                      value={joinCode}
+                      onChange={(e) => setJoinCode(e.target.value)}
+                      placeholder="Enter invite code"
+                      className="w-full bg-slate-900 border border-slate-800 rounded-2xl px-4 py-3 text-sm text-slate-100 focus:outline-none focus:border-sky-500"
+                    />
+                    <button
+                      onClick={() => {} }
+                      className="w-full bg-slate-700 hover:bg-slate-600 text-slate-100 text-xs font-bold uppercase tracking-wide py-3 rounded-2xl transition"
+                    >
+                      Join session
+                    </button>
+                  </section>
                 </div>
-                <div className="rounded-3xl bg-slate-950/80 p-3">
-                  <div className="mb-2 text-[11px] uppercase tracking-[0.2em] text-slate-500">Activity</div>
-                  <div className="space-y-2 max-h-32 overflow-y-auto">
-                    {session.events.length === 0 ? (
-                      <div className="rounded-2xl bg-slate-900/90 px-3 py-2 text-slate-500">No activity yet.</div>
-                    ) : (
-                      session.events.slice(-4).reverse().map((event) => (
-                        <div key={event.id} className="rounded-2xl bg-slate-900/90 px-3 py-2 text-slate-200">
-                          <div className="text-[10px] uppercase tracking-[0.2em] text-slate-500">{formatTime(event.timestamp)}</div>
-                          <div>{event.description}</div>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </div>
+              </div>
+
+              <div className="mt-auto rounded-3xl border border-slate-800 bg-slate-950/30 p-4 text-sm text-slate-300">
+                <p className="font-medium text-slate-100">Session state preserved</p>
+                <p className="mt-2 text-[13px] leading-relaxed text-slate-400">Your current AI workspace, tether connection, and shared session state remain active while you switch to the onboarding interface. Return to the workspace instantly with the button in the header.</p>
               </div>
             </div>
           )}
         </div>
-      )}
+
+        {/* Sidebar Session Tether */}
+        {!hideTether && (
+          <div className="w-[320px] flex-shrink-0 bg-slate-900/20 border border-slate-900 rounded-xl p-4 flex flex-col gap-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="font-bold text-slate-200 text-sm">Session tether</h3>
+                <p className="text-[11px] text-slate-500 mt-0.5">Presence, shared chat, and activity feed.</p>
+              </div>
+              <button
+                onClick={() => setShowHistory(!showHistory)}
+                className={`text-[11px] px-2 py-1 rounded-md font-medium transition ${showHistory ? 'bg-slate-800 text-sky-400' : 'bg-slate-950/30 text-slate-300'}`}
+              >
+                AI History
+              </button>
+            </div>
+
+            {/* Active Users */}
+            <div className="bg-slate-950/40 border border-slate-900 rounded-xl p-3 flex flex-col min-h-0">
+              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-2">Users in session</span>
+              <div className="space-y-2 overflow-y-auto pr-1 flex-1 max-h-[140px]">
+                {usersInSession.map((u, idx) => (
+                  <div key={idx} className="flex justify-between items-center bg-slate-900/50 px-3 py-2 rounded-lg border border-slate-900">
+                    <div>
+                      <div className={`text-xs font-bold ${u.name === currentUserName ? 'text-sky-400' : 'text-slate-200'}`}>{u.name}</div>
+                      <div className="text-[9px] text-slate-400 uppercase tracking-tight mt-0.5 font-medium">{u.role}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {showHistory && (
+              <div className="bg-slate-950/40 border border-slate-900 rounded-xl p-3 flex flex-col min-h-0">
+                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-2">Private AI history</span>
+                <div className="space-y-2 overflow-y-auto pr-1 flex-1 max-h-[180px]">
+                  {messages.length === 0 ? (
+                    <div className="text-xs text-slate-500 italic">No private history yet.</div>
+                  ) : (
+                    messages.map((msg, idx) => (
+                      <div key={idx} className="bg-slate-900/40 border border-slate-900 p-2.5 rounded-xl text-xs">
+                        <span className="text-[9px] font-mono text-sky-400 font-bold block mb-1">{msg.sender === 'human' ? 'You' : 'Personal AI'}</span>
+                        <p className="text-slate-200 font-medium leading-relaxed">{msg.text}</p>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Shared Chat Feed */}
+            <div className="flex-1 flex flex-col min-h-0 bg-slate-950/40 border border-slate-900 rounded-xl p-3">
+              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-2">Shared tether chat</span>
+              
+              <div className="flex-1 overflow-y-auto space-y-2.5 pr-1 mb-2">
+                {tetherMessages.map((msg, idx) => (
+                  <div key={idx} className="bg-slate-900/40 border border-slate-900 p-2.5 rounded-xl text-xs">
+                    <span className="text-[9px] font-mono text-sky-400 font-bold block mb-1">{msg.userName || msg.sender || msg.userName}</span>
+                    <p className="text-slate-200 font-medium leading-relaxed">{msg.text}</p>
+                  </div>
+                ))}
+              </div>
+
+              <div className="flex gap-1.5 mt-auto">
+                <input 
+                  type="text" 
+                  value={tetherInput}
+                  onChange={(e) => setTetherInput(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleSendTetherMessage()}
+                  placeholder="Send to shared tether" 
+                  className="flex-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 placeholder-slate-600 focus:outline-none focus:border-sky-500"
+                />
+                <button 
+                  onClick={handleSendTetherMessage}
+                  className="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs px-3 py-2 rounded-lg text-slate-200 font-bold transition"
+                >
+                  Post
+                </button>
+              </div>
+            </div>
+
+            {/* Interaction Settings Preference Panel */}
+            <div className="bg-slate-950/40 border border-slate-900 rounded-xl p-3 space-y-3 text-xs">
+              <div className="flex items-center justify-between">
+                <span className="text-slate-400 font-medium">Auto-open on message</span>
+                <button 
+                  onClick={() => setAutoOpenOnMessage(!autoOpenOnMessage)}
+                  className={`border text-[9px] font-bold px-2.5 py-1 rounded transition uppercase ${
+                    autoOpenOnMessage 
+                      ? 'bg-emerald-950 text-emerald-400 border-emerald-800' 
+                      : 'bg-slate-900 text-slate-500 border-slate-800'
+                  }`}
+                >
+                  {autoOpenOnMessage ? 'ON' : 'OFF'}
+                </button>
+              </div>
+
+              <div className="pt-2 border-t border-slate-900/80 flex items-center justify-between">
+                <span className="text-slate-400 font-medium">Dock side</span>
+                <div className="flex gap-1 bg-slate-950 p-0.5 border border-slate-800 rounded-md">
+                  <button 
+                    onClick={() => setDockSide('Left')}
+                    className={`px-2 py-0.5 rounded text-[9px] font-bold tracking-wide uppercase transition ${
+                      dockSide === 'Left' ? 'bg-sky-600 text-slate-950' : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Left
+                  </button>
+                  <button 
+                    onClick={() => setDockSide('Right')}
+                    className={`px-2 py-0.5 rounded text-[9px] font-bold tracking-wide uppercase transition ${
+                      dockSide === 'Right' ? 'bg-sky-600 text-slate-950' : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Right
+                  </button>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        )}
+
+      </div>
     </div>
   );
 }
-
-export default App;
